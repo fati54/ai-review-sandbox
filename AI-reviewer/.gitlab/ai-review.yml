@@ -1,0 +1,70 @@
+# .gitlab/ai-review.yml
+stages:
+  - ai_review  # n’impacte pas tes stages existants
+
+ai-review:
+  stage: ai_review
+  image: alpine:3.20
+  services:
+    - name: ollama/ollama:latest
+      alias: ollama
+      command: ["serve"]
+  variables:
+    OLLAMA_HOST: http://ollama:11434
+    MODEL_NAME: qwen2.5-coder:7b-instruct
+    MAX_INPUT_CHARS: "90000"
+  # Le job ne bloque pas ton pipeline au début
+  allow_failure: true
+  # Évite les exécutions inutiles
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  before_script:
+    - apk add --no-cache curl jq git
+    # Attendre que l'API Ollama soit prête
+    - |
+      for i in $(seq 1 60); do
+        if curl -sf ${OLLAMA_HOST}/api/tags >/dev/null; then break; fi
+        sleep 2
+      done
+    # Tirer le modèle si absent
+    - |
+      curl -sS -X POST ${OLLAMA_HOST}/api/pull \
+        -H 'Content-Type: application/json' \
+        -d "{\"name\":\"${MODEL_NAME}\"}" >/dev/null
+  script:
+    # Diff compact entre target et HEAD
+    - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --depth=1
+    - git diff --unified=0 "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...$CI_COMMIT_SHA" > patch.diff || true
+    # Tronquer et nettoyer
+    - |
+      TRUNCATED_DIFF="$(sed -E 's/[`$]/ /g' patch.diff | head -c ${MAX_INPUT_CHARS})"
+      PROMPT=$(cat <<'EOF'
+Tu es un **senior code reviewer**. Analyse UNIQUEMENT le diff.
+Donne (Markdown concis) :
+1) Risques & bugs (citer lignes +/-)
+2) Dettes techniques
+3) Suggestions avec mini-patchs
+4) Tests à ajouter
+5) Sécurité & performance
+EOF
+)
+      PAYLOAD=$(jq -n --arg model "$MODEL_NAME" --arg sys "$PROMPT" --arg diff "$TRUNCATED_DIFF" '
+        {"model":$model,"messages":[
+          {"role":"system","content":$sys},
+          {"role":"user","content":("DIFF:\n<<DIFF>>\n"+$diff+"\n<</DIFF>>")}
+        ],"stream":false}')
+      REVIEW=$(curl -sS -X POST "${OLLAMA_HOST}/api/chat" \
+        -H "Content-Type: application/json" -d "$PAYLOAD" | jq -r '.message.content')
+
+    # Poster la note sur la MR
+    - |
+      NOTE_PAYLOAD=$(jq -n --arg body "$REVIEW" '{body:$body}')
+      curl -sS -X POST \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" \
+        -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$NOTE_PAYLOAD" >/dev/null
+  artifacts:
+    when: always
+    paths: [patch.diff]
+

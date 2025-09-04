@@ -1,0 +1,4 @@
+# .gitlab-ci.yml (extrait): à inclure dans .gitlab-ci.yml principal, sans toucher à tes jobs actuels
+include:
+  - local: .gitlab/ai-review.yml
+
