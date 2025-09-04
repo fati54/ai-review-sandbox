@@ -1,0 +1,64 @@
+name: ai-code-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          git diff --unified=0 origin/${{ github.base_ref }}...HEAD > patch.diff || true
+          echo "patch<<EOF" >> $GITHUB_OUTPUT
+          sed -E 's/[`$]/ /g' patch.diff | head -c 90000 >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run AI review with Ollama
+        id: ai
+        uses: ai-action/ollama-action@v1
+        with:
+          model: qwen2.5-coder:7b-instruct
+          prompt: |
+            Tu es un reviewer senior. Analyse le diff :
+            1) Risques & bugs (citer lignes +/-)
+            2) Dettes techniques
+            3) Suggestions concrètes (mini-patchs)
+            4) Tests à ajouter
+            5) Sécurité & perf
+            DIFF:
+            <<DIFF>>
+            ${{ steps.diff.outputs.patch }}
+            <</DIFF>>
+
+      - name: Find existing AI comment
+        id: find
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: AI Code Review
+
+      - name: Post AI review comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            **AI Code Review**
+            ${{ steps.ai.outputs.response }}
